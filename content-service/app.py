@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from pydantic import BaseModel
 from typing import List, Optional
 from enum import Enum
@@ -8,6 +8,9 @@ from datetime import datetime
 import os
 import time
 import sys
+import tempfile
+import shutil
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,7 +60,7 @@ def connect_to_mongodb():
             db = client[MONGODB_DB]
             
             # Créer les collections si elles n'existent pas
-            collections = ["courses", "lessons", "quizzes", "quiz_submissions"]
+            collections = ["courses", "lessons", "quizzes", "quiz_submissions", "uploads"]
             
             existing_collections = db.list_collection_names()
             for collection_name in collections:
@@ -87,6 +90,7 @@ def connect_to_mongodb():
         "lessons": {}, 
         "quizzes": {},
         "quiz_submissions": [],
+        "uploads": [],
         "_id_counter": 1
     }
     
@@ -136,11 +140,18 @@ class TransformRequest(BaseModel):
     content: str
     target_duration: int = 5
 
+class UploadResponse(BaseModel):
+    success: bool
+    message: str
+    course_id: Optional[str] = None
+    micro_lessons_created: int = 0
+    transformation: Optional[dict] = None
+
 # ========== APPLICATION ==========
 app = FastAPI(
     title="Content Service - Micro Learning",
     version="2.0.0",
-    description="Service de gestion de contenu pédagogique",
+    description="Service de gestion de contenu pédagogique et transformation en micro-leçons",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -155,6 +166,7 @@ def get_memory_storage():
             "lessons": {}, 
             "quizzes": {},
             "quiz_submissions": [],
+            "uploads": [],
             "_id_counter": 1
         }
     return memory_storage
@@ -182,6 +194,206 @@ def mongo_to_dict(doc):
         doc["id"] = str(doc["_id"])
         del doc["_id"]
     return doc
+
+def extract_text_from_file(file_path: str, file_type: str) -> str:
+    """Extraire le texte d'un fichier selon son type"""
+    try:
+        if file_type == "text/plain":
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        
+        elif file_type == "application/pdf":
+            try:
+                # Utiliser pypdf (version 3.x)
+                from pypdf import PdfReader
+                
+                logger.info(f"📖 Extraction PDF avec pypdf: {file_path}")
+                text = ""
+                
+                with open(file_path, 'rb') as f:
+                    try:
+                        pdf_reader = PdfReader(f)
+                        num_pages = len(pdf_reader.pages)
+                        logger.info(f"📄 PDF a {num_pages} pages")
+                        
+                        for page_num in range(num_pages):
+                            try:
+                                page = pdf_reader.pages[page_num]
+                                page_text = page.extract_text()
+                                
+                                if page_text:
+                                    # Nettoyer le texte
+                                    page_text = re.sub(r'\s+', ' ', page_text)  # Remplacer multi-espaces
+                                    page_text = page_text.strip()
+                                    text += page_text + "\n\n"
+                                    
+                                    logger.debug(f"Page {page_num + 1}: {len(page_text)} caractères")
+                                else:
+                                    logger.warning(f"Page {page_num + 1}: pas de texte extrait")
+                            except Exception as page_error:
+                                logger.warning(f"Erreur page {page_num + 1}: {page_error}")
+                                continue
+                    except Exception as read_error:
+                        logger.error(f"Erreur lecture PDF: {read_error}")
+                        return f"Erreur lecture PDF: {read_error}"
+                
+                if not text.strip():
+                    logger.warning("⚠️  Aucun texte extrait du PDF")
+                    return "Aucun texte extrait du PDF. Le PDF peut être numérisé ou protégé."
+                
+                logger.info(f"✅ Texte extrait: {len(text)} caractères, {len(text.split())} mots")
+                return text
+                
+            except ImportError as import_error:
+                logger.error(f"❌ pypdf n'est pas installé: {import_error}")
+                return "Bibliothèque pypdf requise pour extraire le texte des PDFs. Installez avec: pip install pypdf"
+            except Exception as e:
+                logger.error(f"❌ Erreur extraction PDF: {e}")
+                return f"Erreur extraction PDF: {str(e)}"
+        
+        else:
+            raise ValueError(f"Type de fichier non supporté: {file_type}")
+            
+    except Exception as e:
+        logger.error(f"❌ Erreur extraction texte: {e}")
+        return f"Erreur extraction texte: {str(e)}"
+
+def clean_text_for_processing(text: str) -> str:
+    """Nettoyer le texte avant transformation"""
+    # Remplacer les retours à la ligne multiples
+    text = re.sub(r'\n+', '\n', text)
+    # Remplacer les espaces multiples
+    text = re.sub(r' +', ' ', text)
+    # Supprimer les caractères de contrôle
+    text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
+    # Supprimer les caractères Unicode problématiques
+    text = re.sub(r'[\u200b-\u200f\u202a-\u202e]', '', text)
+    return text.strip()
+
+def transform_content_internal(content: str, target_duration: int = 5):
+    """Fonction interne de transformation"""
+    try:
+        # Nettoyer le contenu
+        content = clean_text_for_processing(content)
+        
+        if not content or len(content.strip()) < 10:
+            raise ValueError("Contenu trop court ou vide")
+        
+        logger.info(f"🔄 Transformation contenu: {len(content)} caractères, {len(content.split())} mots, durée cible: {target_duration}min")
+        
+        try:
+            from nltk.tokenize import sent_tokenize
+            
+            # Télécharger les ressources NLTK si nécessaire
+            try:
+                import nltk
+                nltk.data.find('tokenizers/punkt')
+            except LookupError:
+                logger.info("📥 Téléchargement des ressources NLTK...")
+                nltk.download('punkt', quiet=True)
+            
+            # Tokenizer les phrases
+            sentences = sent_tokenize(content)
+            logger.info(f"📝 {len(sentences)} phrases détectées")
+            
+            micro_lessons = []
+            current_lesson = ""
+            word_count = 0
+            
+            # ~200 mots/minute = 1000 mots pour 5 minutes
+            target_words = target_duration * 200
+            
+            for sentence in sentences:
+                sentence_words = len(sentence.split())
+                
+                if word_count + sentence_words > target_words and current_lesson:
+                    # Créer une micro-leçon
+                    lesson_num = len(micro_lessons) + 1
+                    lesson_title = f"Micro-leçon {lesson_num}"
+                    
+                    # Essayer d'extraire un titre du contenu
+                    if lesson_num == 1 and len(current_lesson.split()) > 50:
+                        # Prendre les premiers 10 mots comme titre potentiel
+                        first_words = current_lesson.split()[:10]
+                        if len(first_words) >= 3:
+                            lesson_title = " ".join(first_words) + "..."
+                    
+                    micro_lessons.append({
+                        "title": lesson_title,
+                        "content": current_lesson.strip(),
+                        "estimated_minutes": max(1, min(target_duration, round(word_count / 200))),
+                        "word_count": word_count,
+                        "order": lesson_num
+                    })
+                    current_lesson = ""
+                    word_count = 0
+                
+                current_lesson += sentence + " "
+                word_count += sentence_words
+            
+            # Dernière leçon
+            if current_lesson:
+                lesson_num = len(micro_lessons) + 1
+                micro_lessons.append({
+                    "title": f"Micro-leçon {lesson_num}",
+                    "content": current_lesson.strip(),
+                    "estimated_minutes": max(1, round(word_count / 200)),
+                    "word_count": word_count,
+                    "order": lesson_num
+                })
+            
+            # Si le contenu est court, créer une seule leçon avec résumé
+            if len(micro_lessons) == 1 and len(content.split()) < 500:
+                micro_lessons[0]["title"] = "Résumé complet"
+                micro_lessons[0]["is_summary"] = True
+            
+            logger.info(f"✅ Transformé en {len(micro_lessons)} micro-leçons")
+            
+            return {
+                "success": True,
+                "micro_lessons": micro_lessons,
+                "total_lessons": len(micro_lessons),
+                "total_duration": sum(l["estimated_minutes"] for l in micro_lessons),
+                "total_words": sum(l["word_count"] for l in micro_lessons),
+                "message": f"Transformé en {len(micro_lessons)} micro-leçons"
+            }
+            
+        except ImportError as nltk_error:
+            logger.warning(f"NLTK non disponible: {nltk_error}, utilisation du mode fallback")
+            # Fallback si nltk n'est pas disponible
+            words = content.split()
+            chunk_size = target_duration * 200
+            chunks = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
+            
+            micro_lessons = []
+            for i, chunk in enumerate(chunks):
+                lesson_title = f"Micro-leçon {i + 1}"
+                if i == 0 and len(chunk) > 10:
+                    # Prendre les premiers mots comme titre
+                    lesson_title = " ".join(chunk[:5]) + "..."
+                
+                micro_lessons.append({
+                    "title": lesson_title,
+                    "content": " ".join(chunk),
+                    "estimated_minutes": target_duration,
+                    "word_count": len(chunk),
+                    "order": i + 1
+                })
+            
+            logger.info(f"✅ Transformé en {len(micro_lessons)} micro-leçons (fallback mode)")
+            
+            return {
+                "success": True,
+                "micro_lessons": micro_lessons,
+                "total_lessons": len(micro_lessons),
+                "total_duration": len(micro_lessons) * target_duration,
+                "total_words": sum(l["word_count"] for l in micro_lessons),
+                "message": f"Transformé en {len(micro_lessons)} micro-leçons (mode fallback)"
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Erreur transformation: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur transformation: {str(e)}")
 
 # ========== EVENT HANDLERS ==========
 @app.on_event("startup")
@@ -232,16 +444,18 @@ def shutdown_event():
 def root():
     mongodb_connected = is_mongodb_connected()
     return {
-        "service": "Content Service",
+        "service": "Content Service - Micro Learning",
         "version": "2.0.0",
         "database": "mongodb" if mongodb_connected else "memory",
         "status": "running",
+        "micro_learning": True,
+        "upload_supported": True,
         "timestamp": datetime.utcnow().isoformat()
     }
 
 @app.get("/health")
 def health():
-    """Health check - CORRIGÉ pour PyMongo"""
+    """Health check"""
     try:
         mongodb_connected = is_mongodb_connected()
         
@@ -259,6 +473,7 @@ def health():
             "status": service_status,
             "database": db_status,
             "service": "content-service",
+            "micro_learning": True,
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
@@ -269,57 +484,197 @@ def health():
             "timestamp": datetime.utcnow().isoformat()
         }
 
-@app.get("/config")
-def get_config():
-    """Afficher la configuration"""
-    mongodb_connected = is_mongodb_connected()
-    return {
-        "mongodb_host": MONGODB_HOST,
-        "mongodb_db": MONGODB_DB,
-        "upload_dir": UPLOAD_DIR,
-        "database_mode": "mongodb" if mongodb_connected else "memory",
-        "mongodb_connected": mongodb_connected,
-        "host": "0.0.0.0",
-        "port": 8001
-    }
+# ========== UPLOAD ENDPOINT ==========
 
-@app.get("/test")
-def test_endpoint():
-    """Endpoint de test simple"""
-    mongodb_connected = is_mongodb_connected()
-    return {
-        "message": "Service content opérationnel",
-        "database": "mongodb" if mongodb_connected else "memory",
-        "mongodb_connected": mongodb_connected,
-        "timestamp": datetime.utcnow().isoformat(),
-        "status": "ok"
-    }
-
-@app.get("/database/ping")
-def ping_mongodb():
-    """Tester directement la connexion MongoDB"""
+@app.post("/upload", response_model=UploadResponse)
+async def upload_and_transform_course(
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    teacher_id: str = Form(...),
+    subject: str = Form(...),
+    description: Optional[str] = Form(None),
+    tags: str = Form(""),
+    target_duration: int = Form(5, ge=1, le=30)
+):
+    """
+    Upload un cours (PDF/TXT) et le transforme automatiquement en micro-leçons
+    """
     try:
-        from pymongo import MongoClient
+        logger.info(f"📤 Upload cours: {title} par {teacher_id}")
         
-        MONGODB_URL = f"{MONGODB_HOST}/{MONGODB_DB}?authSource=admin"
+        # Vérifier le type de fichier
+        allowed_types = ["text/plain", "application/pdf"]
+        if file.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Type de fichier non supporté. Utilisez: {', '.join(allowed_types)}"
+            )
         
-        # Test direct
-        test_client = MongoClient(MONGODB_URL, serverSelectionTimeoutMS=3000)
-        test_client.admin.command('ping')
-        test_client.close()
-        
-        return {
-            "status": "success",
-            "message": "MongoDB is reachable",
-            "url": MONGODB_HOST
-        }
+        # Sauvegarder le fichier temporairement
+        temp_file = None
+        try:
+            # Créer un fichier temporaire
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}")
+            
+            # Écrire le contenu
+            content_bytes = await file.read()
+            temp_file.write(content_bytes)
+            temp_file.close()
+            
+            # Extraire le texte du fichier
+            logger.info(f"📄 Extraction texte depuis: {file.filename}")
+            text_content = extract_text_from_file(temp_file.name, file.content_type)
+            
+            # Vérifier si l'extraction a échoué
+            if text_content.startswith("Erreur") or text_content.startswith("Aucun texte"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Échec de l'extraction du texte: {text_content}"
+                )
+            
+            if not text_content or len(text_content.strip()) < 50:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Le fichier est vide ou ne contient pas assez de texte"
+                )
+            
+            # Créer le cours dans la base
+            tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+            
+            course_data = {
+                "title": title,
+                "description": description,
+                "teacher_id": teacher_id,
+                "subject": subject,
+                "tags": tags_list,
+                "status": "published",
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "lesson_count": 0,
+                "quiz_count": 0,
+                "original_filename": file.filename,
+                "file_type": file.content_type,
+                "file_size": len(content_bytes)
+            }
+            
+            if is_mongodb_connected():
+                # Sauvegarder dans MongoDB
+                result = db.courses.insert_one(course_data)
+                course_id = str(result.inserted_id)
+                
+                # Sauvegarder les métadonnées d'upload
+                upload_data = {
+                    "course_id": course_id,
+                    "filename": file.filename,
+                    "file_type": file.content_type,
+                    "file_size": len(content_bytes),
+                    "uploaded_at": datetime.utcnow(),
+                    "teacher_id": teacher_id
+                }
+                db.uploads.insert_one(upload_data)
+                
+                storage = "mongodb"
+            else:
+                # Mode mémoire
+                storage_obj = get_memory_storage()
+                course_id = generate_memory_id()
+                course_data["_id"] = course_id
+                storage_obj["courses"][course_id] = course_data
+                
+                upload_data = {
+                    "_id": generate_memory_id(),
+                    "course_id": course_id,
+                    "filename": file.filename,
+                    "file_type": file.content_type,
+                    "file_size": len(content_bytes),
+                    "uploaded_at": datetime.utcnow(),
+                    "teacher_id": teacher_id
+                }
+                storage_obj["uploads"].append(upload_data)
+                
+                storage = "memory"
+            
+            # Transformer le contenu en micro-leçons
+            logger.info(f"🔄 Transformation en micro-leçons de {target_duration}min")
+            transform_result = transform_content_internal(text_content, target_duration)
+            
+            # Créer les micro-leçons dans la base
+            lessons_created = []
+            for i, micro_lesson in enumerate(transform_result["micro_lessons"]):
+                lesson_data = {
+                    "course_id": course_id,
+                    "title": micro_lesson["title"],
+                    "content": micro_lesson["content"],
+                    "duration_minutes": micro_lesson["estimated_minutes"],
+                    "order": i + 1,
+                    "tags": tags_list,
+                    "created_at": datetime.utcnow(),
+                    "views": 0,
+                    "word_count": micro_lesson.get("word_count", 0),
+                    "is_micro_lesson": True,
+                    "source_file": file.filename
+                }
+                
+                if is_mongodb_connected():
+                    # Insérer la leçon
+                    lesson_result = db.lessons.insert_one(lesson_data)
+                    lesson_id = str(lesson_result.inserted_id)
+                    
+                    # Mettre à jour le compteur de leçons du cours
+                    from bson import ObjectId
+                    db.courses.update_one(
+                        {"_id": ObjectId(course_id)},
+                        {"$inc": {"lesson_count": 1}}
+                    )
+                else:
+                    # Mode mémoire
+                    storage_obj = get_memory_storage()
+                    lesson_id = generate_memory_id()
+                    lesson_data["_id"] = lesson_id
+                    storage_obj["lessons"][lesson_id] = lesson_data
+                    
+                    # Mettre à jour le compteur de leçons
+                    if course_id in storage_obj["courses"]:
+                        storage_obj["courses"][course_id]["lesson_count"] = \
+                            storage_obj["courses"][course_id].get("lesson_count", 0) + 1
+                
+                lessons_created.append(lesson_id)
+            
+            logger.info(f"✅ Upload réussi: {len(lessons_created)} micro-leçons créées")
+            
+            return {
+                "success": True,
+                "message": f"Cours uploadé et transformé en {len(lessons_created)} micro-leçons",
+                "course_id": course_id,
+                "micro_lessons_created": len(lessons_created),
+                "transformation": transform_result
+            }
+            
+        finally:
+            # Nettoyer le fichier temporaire
+            if temp_file and os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
+                
+    except HTTPException:
+        raise
     except Exception as e:
-        return {
-            "status": "error",
-            "message": "MongoDB is not reachable",
-            "error": str(e),
-            "url": MONGODB_HOST
-        }
+        logger.error(f"❌ Erreur upload: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors du traitement du fichier: {str(e)}"
+        )
+
+# ========== TRANSFORM ENDPOINT ==========
+
+@app.post("/transform")
+def transform_content(request: TransformRequest):
+    """Transformer du contenu en micro-leçons"""
+    return transform_content_internal(request.content, request.target_duration)
+
+@app.post("/transform-micro")
+def transform_to_micro(content: str = Form(...)):
+    """Transformer en micro-leçons de 5 minutes (durée fixe pour micro-learning)"""
+    return transform_content_internal(content, 5)
 
 # ========== COURS ENDPOINTS ==========
 
@@ -420,116 +775,17 @@ def get_course(course_id: str):
         logger.error(f"Erreur récupération cours: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# ========== TRANSFORM ENDPOINT ==========
-
-@app.post("/transform")
-def transform_content(request: TransformRequest):
-    """Transformer du contenu en micro-leçons - VERSION CORRIGÉE"""
-    try:
-        content = request.content
-        target_duration = request.target_duration
-        
-        if not content or len(content.strip()) < 10:
-            raise HTTPException(status_code=400, detail="Content too short")
-        
-        logger.info(f"Transforming content: {len(content)} chars, duration: {target_duration}min")
-        
-        try:
-            from nltk.tokenize import sent_tokenize
-            
-            # Simple transformation pour démo
-            sentences = sent_tokenize(content)
-            
-            micro_lessons = []
-            current_lesson = ""
-            word_count = 0
-            
-            # ~200 mots/minute = 1000 mots pour 5 minutes
-            target_words = target_duration * 200
-            
-            for sentence in sentences:
-                sentence_words = len(sentence.split())
-                
-                if word_count + sentence_words > target_words and current_lesson:
-                    # Créer une micro-leçon
-                    micro_lessons.append({
-                        "title": f"Leçon {len(micro_lessons) + 1}",
-                        "content": current_lesson.strip(),
-                        "estimated_minutes": max(1, round(word_count / 200)),
-                        "word_count": word_count,
-                        "order": len(micro_lessons) + 1
-                    })
-                    current_lesson = ""
-                    word_count = 0
-                
-                current_lesson += sentence + " "
-                word_count += sentence_words
-            
-            # Dernière leçon
-            if current_lesson:
-                micro_lessons.append({
-                    "title": f"Leçon {len(micro_lessons) + 1}",
-                    "content": current_lesson.strip(),
-                    "estimated_minutes": max(1, round(word_count / 200)),
-                    "word_count": word_count,
-                    "order": len(micro_lessons) + 1
-                })
-            
-            return {
-                "success": True,
-                "micro_lessons": micro_lessons,
-                "total_lessons": len(micro_lessons),
-                "total_duration": sum(l["estimated_minutes"] for l in micro_lessons),
-                "message": f"Transformed into {len(micro_lessons)} micro-lessons"
-            }
-            
-        except ImportError:
-            # Fallback si nltk n'est pas disponible
-            words = content.split()
-            chunk_size = target_duration * 200
-            chunks = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
-            
-            micro_lessons = []
-            for i, chunk in enumerate(chunks):
-                micro_lessons.append({
-                    "title": f"Leçon {i + 1}",
-                    "content": " ".join(chunk),
-                    "estimated_minutes": target_duration,
-                    "word_count": len(chunk),
-                    "order": i + 1
-                })
-            
-            return {
-                "success": True,
-                "micro_lessons": micro_lessons,
-                "total_lessons": len(micro_lessons),
-                "total_duration": len(micro_lessons) * target_duration,
-                "message": f"Transformed into {len(micro_lessons)} micro-lessons (fallback mode)"
-            }
-            
-    except Exception as e:
-        logger.error(f"Erreur transformation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Version alternative avec Form (si vous préférez)
-@app.post("/transform-form")
-def transform_content_form(
-    content: str = Form(...),
-    target_duration: int = Form(5)
-):
-    """Transformer du contenu en micro-leçons (version Form)"""
-    request = TransformRequest(content=content, target_duration=target_duration)
-    return transform_content(request)
-
 # ========== LESSONS ENDPOINTS ==========
 
 @app.get("/lessons")
-def get_lessons(course_id: Optional[str] = None):
+def get_lessons(course_id: Optional[str] = None, micro_only: bool = False):
     """Lister les leçons (optionnellement par cours)"""
     try:
         if is_mongodb_connected():
             try:
                 query = {"course_id": course_id} if course_id else {}
+                if micro_only:
+                    query["is_micro_lesson"] = True
                 cursor = db.lessons.find(query).sort("order", 1).limit(100)
                 lessons = [mongo_to_dict(lesson) for lesson in cursor]
                 storage = "mongodb"
@@ -543,14 +799,22 @@ def get_lessons(course_id: Optional[str] = None):
                 lessons = [l for l in storage_obj["lessons"].values() if l.get("course_id") == course_id]
             else:
                 lessons = list(storage_obj["lessons"].values())
+            
+            if micro_only:
+                lessons = [l for l in lessons if l.get("is_micro_lesson", False)]
+            
             lessons.sort(key=lambda x: x.get("order", 0))
             storage = "memory"
+        
+        micro_lessons = [l for l in lessons if l.get("is_micro_lesson", False)]
         
         return {
             "lessons": lessons,
             "total": len(lessons),
+            "micro_lessons": len(micro_lessons),
             "storage": storage,
-            "course_filter": course_id
+            "course_filter": course_id,
+            "micro_only": micro_only
         }
     except Exception as e:
         logger.error(f"Erreur récupération leçons: {e}")
@@ -568,6 +832,7 @@ def create_lesson(lesson: LessonCreate):
         lesson_data = lesson.dict()
         lesson_data["created_at"] = datetime.utcnow()
         lesson_data["views"] = 0
+        lesson_data["is_micro_lesson"] = lesson_data.get("duration_minutes", 5) <= 10
         
         if is_mongodb_connected():
             try:
@@ -599,11 +864,15 @@ def create_lesson(lesson: LessonCreate):
             storage_obj["lessons"][lesson_id] = lesson_data
             storage = "memory"
         
+        lesson_type = "micro-leçon" if lesson_data["is_micro_lesson"] else "leçon"
+        logger.info(f"📝 {lesson_type} créée: {lesson.title}")
+        
         return {
             "id": lesson_id,
-            "message": "Lesson created successfully",
+            "message": f"{lesson_type.capitalize()} created successfully",
             "storage": storage,
-            "title": lesson.title
+            "title": lesson.title,
+            "is_micro_lesson": lesson_data["is_micro_lesson"]
         }
     except HTTPException:
         raise
@@ -737,32 +1006,6 @@ def get_quizzes(course_id: Optional[str] = None):
             "error": str(e)
         }
 
-@app.get("/quiz/{quiz_id}")
-def get_quiz(quiz_id: str):
-    """Récupérer un quiz spécifique"""
-    try:
-        if is_mongodb_connected():
-            try:
-                from bson import ObjectId
-                quiz = db.quizzes.find_one({"_id": ObjectId(quiz_id)})
-                if not quiz:
-                    raise HTTPException(status_code=404, detail="Quiz not found")
-                return mongo_to_dict(quiz)
-            except Exception as e:
-                logger.error(f"Erreur MongoDB: {e}")
-                raise HTTPException(status_code=404, detail="Quiz not found")
-        else:
-            storage_obj = get_memory_storage()
-            quiz = storage_obj["quizzes"].get(quiz_id)
-            if not quiz:
-                raise HTTPException(status_code=404, detail="Quiz not found")
-            return quiz
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur récupération quiz: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
 # ========== STATS ENDPOINT ==========
 
 @app.get("/stats")
@@ -773,7 +1016,9 @@ def get_stats():
             try:
                 courses_count = db.courses.count_documents({})
                 lessons_count = db.lessons.count_documents({})
+                micro_lessons_count = db.lessons.count_documents({"is_micro_lesson": True})
                 quizzes_count = db.quizzes.count_documents({})
+                uploads_count = db.uploads.count_documents({})
                 
                 # Total des vues de leçons
                 pipeline = [{"$group": {"_id": None, "total_views": {"$sum": "$views"}}}]
@@ -783,21 +1028,28 @@ def get_stats():
                 storage = "mongodb"
             except Exception as e:
                 logger.error(f"Erreur MongoDB stats: {e}")
-                courses_count = lessons_count = quizzes_count = total_views = 0
+                courses_count = lessons_count = micro_lessons_count = quizzes_count = uploads_count = total_views = 0
                 storage = "error"
         else:
             storage_obj = get_memory_storage()
             courses_count = len(storage_obj["courses"])
             lessons_count = len(storage_obj["lessons"])
+            micro_lessons_count = len([l for l in storage_obj["lessons"].values() if l.get("is_micro_lesson", False)])
             quizzes_count = len(storage_obj["quizzes"])
+            uploads_count = len(storage_obj["uploads"])
             total_views = sum(l.get("views", 0) for l in storage_obj["lessons"].values())
             storage = "memory"
+        
+        ratio = (micro_lessons_count/lessons_count*100) if lessons_count > 0 else 0
         
         return {
             "courses_count": courses_count,
             "lessons_count": lessons_count,
+            "micro_lessons_count": micro_lessons_count,
             "quizzes_count": quizzes_count,
+            "uploads_count": uploads_count,
             "total_lesson_views": total_views,
+            "micro_learning_ratio": f"{ratio:.1f}%",
             "storage": storage,
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -817,25 +1069,30 @@ if __name__ == "__main__":
     print(f"🔌 Port: 8001")
     print(f"📊 MongoDB Host: {MONGODB_HOST}")
     print(f"🗃️  Database: {MONGODB_DB}")
+    print(f"📁 Upload Directory: {UPLOAD_DIR}")
     print(f"📚 Docs: http://localhost:8001/docs")
     print("=" * 60)
     print("📋 Endpoints disponibles:")
-    print("  GET  /               - Page d'accueil")
-    print("  GET  /health         - Health check")
-    print("  GET  /config         - Configuration")
-    print("  GET  /database/ping  - Tester MongoDB")
-    print("  POST /course         - Créer un cours")
-    print("  GET  /course         - Lister les cours")
-    print("  GET  /course/{id}    - Récupérer un cours")
-    print("  POST /transform      - Transformer du contenu (JSON)")
-    print("  POST /transform-form - Transformer (Form)")
-    print("  GET  /lessons        - Lister les leçons")
-    print("  POST /lessons        - Créer une leçon")
-    print("  GET  /lessons/{id}   - Récupérer une leçon")
-    print("  POST /quiz           - Créer un quiz")
-    print("  GET  /quiz           - Lister les quiz")
-    print("  GET  /quiz/{id}      - Récupérer un quiz")
-    print("  GET  /stats          - Statistiques")
+    print("  POST /upload        - Upload cours (PDF/TXT) → micro-leçons")
+    print("  POST /transform     - Transformer texte → micro-leçons")
+    print("  POST /transform-micro - Transformer (5min fixe)")
+    print("  POST /course        - Créer un cours manuellement")
+    print("  GET  /course        - Lister les cours")
+    print("  GET  /course/{id}   - Récupérer un cours")
+    print("  GET  /lessons       - Lister les leçons")
+    print("  POST /lessons       - Créer une leçon/micro-leçon")
+    print("  GET  /lessons/{id}  - Récupérer une leçon")
+    print("  POST /quiz          - Créer un quiz")
+    print("  GET  /quiz          - Lister les quiz")
+    print("  GET  /stats         - Statistiques micro-learning")
+    print("  GET  /health        - Health check")
+    print("=" * 60)
+    print("🎯 Micro-learning features:")
+    print("  • Upload automatique PDF/TXT → micro-leçons")
+    print("  • Découpage intelligent (NLTK)")
+    print("  • Durée optimisée (5 min par défaut)")
+    print("  • Détection automatique micro-leçons")
+    print("  • Statistiques dédiées")
     print("=" * 60)
     
     # Initialiser memory_storage au cas où
