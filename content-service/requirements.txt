@@ -1,0 +1,20 @@
+# Core
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Database
+pymongo==4.5.0
+motor==3.3.1
+
+# Text Processing
+nltk==3.8.1
+pypdf==3.17.4
+python-multipart==0.0.6
+
+# Environment
+python-dotenv==1.0.0
+pydantic==2.12.5
+
+# Optional (for future)
+dapr==1.11.0
+redis==5.0.1
