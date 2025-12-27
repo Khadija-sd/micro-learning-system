@@ -1,6 +1,8 @@
+# models/quiz.py
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+from enum import Enum
 
 class QuizQuestion(BaseModel):
     text: str = Field(..., min_length=10)
@@ -35,18 +37,42 @@ class QuizSubmission(BaseModel):
     quiz_id: str
     user_id: str
     answers: List[str]  # List of selected answers
-    
-    class Config:
-        from_attributes = True
+
+class QuizSubmissionDetail(BaseModel):
+    quiz_id: str
+    user_id: str
+    answers: List[str]
+    submitted_at: datetime = Field(default_factory=datetime.utcnow)
 
 class QuizResult(BaseModel):
     quiz_id: str
     user_id: str
     score: int
+    percentage: float
     passed: bool
     total_questions: int
     correct_answers: int
+    total_points: int
+    earned_points: int
     submitted_at: datetime
-    
-    class Config:
-        from_attributes = True
+    time_taken_seconds: Optional[float] = None
+
+class UserQuizStats(BaseModel):
+    user_id: str
+    quiz_id: str
+    best_score: int
+    best_percentage: float
+    attempts_count: int
+    last_attempt: Optional[datetime]
+    average_score: float
+
+class QuizAttempt(BaseModel):
+    id: str
+    quiz_id: str
+    user_id: str
+    score: int
+    percentage: float
+    passed: bool
+    submitted_at: datetime
+    answers: List[str]
+    correct_answers: List[bool]

@@ -147,6 +147,43 @@ class UploadResponse(BaseModel):
     micro_lessons_created: int = 0
     transformation: Optional[dict] = None
 
+# ========== MODÈLES AJOUTÉS POUR LES QUIZ ==========
+class QuizSubmissionRequest(BaseModel):
+    user_id: str
+    answers: List[str]
+
+class QuizScoreResponse(BaseModel):
+    quiz_id: str
+    user_id: str
+    score: int
+    percentage: float
+    passed: bool
+    total_questions: int
+    correct_answers: int
+    total_points: int
+    earned_points: int
+    submitted_at: datetime
+    answers_feedback: List[dict]
+
+class QuizAttemptResponse(BaseModel):
+    id: str
+    quiz_id: str
+    user_id: str
+    score: int
+    percentage: float
+    passed: bool
+    submitted_at: datetime
+
+class UserQuizStatsResponse(BaseModel):
+    user_id: str
+    quiz_id: str
+    quiz_title: str
+    best_score: int
+    best_percentage: float
+    attempts_count: int
+    last_attempt: Optional[datetime]
+    average_score: float
+
 # ========== APPLICATION ==========
 app = FastAPI(
     title="Content Service - Micro Learning",
@@ -394,6 +431,91 @@ def transform_content_internal(content: str, target_duration: int = 5):
     except Exception as e:
         logger.error(f"❌ Erreur transformation: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur transformation: {str(e)}")
+
+# ========== FONCTIONS AJOUTÉES POUR LES QUIZ ==========
+def calculate_quiz_score(quiz: dict, answers: List[str]) -> dict:
+    """Calculer le score d'un quiz"""
+    try:
+        questions = quiz.get("questions", [])
+        total_questions = len(questions)
+        total_points = sum(q.get("points", 1) for q in questions)
+        
+        correct_answers = 0
+        earned_points = 0
+        answers_feedback = []
+        
+        for i, (question, user_answer) in enumerate(zip(questions, answers)):
+            is_correct = user_answer.strip().lower() == question["correct_answer"].strip().lower()
+            question_points = question.get("points", 1)
+            
+            if is_correct:
+                correct_answers += 1
+                earned_points += question_points
+            
+            answers_feedback.append({
+                "question_index": i,
+                "question_text": question["text"],
+                "user_answer": user_answer,
+                "correct_answer": question["correct_answer"],
+                "is_correct": is_correct,
+                "points": question_points,
+                "earned_points": question_points if is_correct else 0,
+                "options": question.get("options", [])
+            })
+        
+        score = earned_points
+        percentage = (earned_points / total_points * 100) if total_points > 0 else 0
+        passing_score = quiz.get("passing_score", 70)
+        passed = percentage >= passing_score
+        
+        return {
+            "score": score,
+            "percentage": round(percentage, 2),
+            "passed": passed,
+            "total_questions": total_questions,
+            "correct_answers": correct_answers,
+            "total_points": total_points,
+            "earned_points": earned_points,
+            "answers_feedback": answers_feedback
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur calcul score quiz: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur calcul score: {str(e)}")
+
+def update_quiz_statistics(quiz_id: str, score_percentage: float):
+    """Mettre à jour les statistiques du quiz"""
+    try:
+        if is_mongodb_connected():
+            from bson import ObjectId
+            
+            # Récupérer le quiz
+            quiz = db.quizzes.find_one({"_id": ObjectId(quiz_id)})
+            if not quiz:
+                return
+            
+            # Mettre à jour les statistiques
+            attempts = quiz.get("attempts", 0) + 1
+            current_avg = quiz.get("average_score", 0.0)
+            
+            # Nouvelle moyenne = (ancienne moyenne * (n-1) + nouveau score) / n
+            new_average = ((current_avg * (attempts - 1)) + score_percentage) / attempts
+            
+            db.quizzes.update_one(
+                {"_id": ObjectId(quiz_id)},
+                {
+                    "$set": {
+                        "attempts": attempts,
+                        "average_score": round(new_average, 2),
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            logger.info(f"📊 Statistiques quiz mises à jour: {quiz_id}, tentatives: {attempts}, moyenne: {new_average:.1f}%")
+            
+    except Exception as e:
+        logger.error(f"Erreur mise à jour statistiques quiz: {e}")
 
 # ========== EVENT HANDLERS ==========
 @app.on_event("startup")
@@ -1006,6 +1128,457 @@ def get_quizzes(course_id: Optional[str] = None):
             "error": str(e)
         }
 
+# ========== ENDPOINTS AJOUTÉS POUR LES QUIZ ==========
+
+@app.post("/quiz/{quiz_id}/submit")
+def submit_quiz_answers(quiz_id: str, submission: QuizSubmissionRequest):
+    """Soumettre les réponses d'un quiz et obtenir le score"""
+    try:
+        logger.info(f"📝 Soumission quiz: {quiz_id} par utilisateur: {submission.user_id}")
+        
+        if is_mongodb_connected():
+            try:
+                from bson import ObjectId
+                
+                # Récupérer le quiz
+                quiz = db.quizzes.find_one({"_id": ObjectId(quiz_id)})
+                if not quiz:
+                    raise HTTPException(status_code=404, detail="Quiz not found")
+                
+                # Vérifier le nombre de réponses
+                questions_count = len(quiz.get("questions", []))
+                if len(submission.answers) != questions_count:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Nombre de réponses incorrect. Attendu: {questions_count}, Reçu: {len(submission.answers)}"
+                    )
+                
+                # Calculer le score
+                score_result = calculate_quiz_score(quiz, submission.answers)
+                
+                # Créer l'enregistrement de soumission
+                submission_data = {
+                    "quiz_id": quiz_id,
+                    "user_id": submission.user_id,
+                    "answers": submission.answers,
+                    "score": score_result["score"],
+                    "percentage": score_result["percentage"],
+                    "passed": score_result["passed"],
+                    "total_questions": score_result["total_questions"],
+                    "correct_answers": score_result["correct_answers"],
+                    "total_points": score_result["total_points"],
+                    "earned_points": score_result["earned_points"],
+                    "submitted_at": datetime.utcnow(),
+                    "answers_feedback": score_result["answers_feedback"]
+                }
+                
+                # Enregistrer la soumission
+                result = db.quiz_submissions.insert_one(submission_data)
+                submission_id = str(result.inserted_id)
+                
+                # Mettre à jour les statistiques du quiz
+                update_quiz_statistics(quiz_id, score_result["percentage"])
+                
+                logger.info(f"✅ Quiz soumis: {quiz['title']}, Score: {score_result['score']}/{score_result['total_points']} ({score_result['percentage']}%)")
+                
+                return {
+                    "submission_id": submission_id,
+                    "quiz_id": quiz_id,
+                    "quiz_title": quiz.get("title", ""),
+                    "user_id": submission.user_id,
+                    "score": score_result["score"],
+                    "percentage": score_result["percentage"],
+                    "passed": score_result["passed"],
+                    "total_questions": score_result["total_questions"],
+                    "correct_answers": score_result["correct_answers"],
+                    "total_points": score_result["total_points"],
+                    "earned_points": score_result["earned_points"],
+                    "submitted_at": submission_data["submitted_at"],
+                    "message": "Quiz submitted successfully"
+                }
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"❌ Erreur soumission quiz: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        else:
+            # Mode mémoire
+            storage_obj = get_memory_storage()
+            
+            # Récupérer le quiz
+            quiz = None
+            for q_id, q in storage_obj["quizzes"].items():
+                if q_id == quiz_id:
+                    quiz = q
+                    break
+            
+            if not quiz:
+                raise HTTPException(status_code=404, detail="Quiz not found")
+            
+            # Calculer le score
+            score_result = calculate_quiz_score(quiz, submission.answers)
+            
+            # Créer l'enregistrement de soumission
+            submission_id = generate_memory_id()
+            submission_data = {
+                "_id": submission_id,
+                "quiz_id": quiz_id,
+                "user_id": submission.user_id,
+                "answers": submission.answers,
+                "score": score_result["score"],
+                "percentage": score_result["percentage"],
+                "passed": score_result["passed"],
+                "total_questions": score_result["total_questions"],
+                "correct_answers": score_result["correct_answers"],
+                "total_points": score_result["total_points"],
+                "earned_points": score_result["earned_points"],
+                "submitted_at": datetime.utcnow(),
+                "answers_feedback": score_result["answers_feedback"]
+            }
+            
+            # Enregistrer la soumission
+            storage_obj["quiz_submissions"].append(submission_data)
+            
+            # Mettre à jour les statistiques du quiz
+            if quiz_id in storage_obj["quizzes"]:
+                quiz_obj = storage_obj["quizzes"][quiz_id]
+                attempts = quiz_obj.get("attempts", 0) + 1
+                current_avg = quiz_obj.get("average_score", 0.0)
+                new_average = ((current_avg * (attempts - 1)) + score_result["percentage"]) / attempts
+                
+                quiz_obj["attempts"] = attempts
+                quiz_obj["average_score"] = round(new_average, 2)
+                quiz_obj["updated_at"] = datetime.utcnow()
+            
+            return {
+                "submission_id": submission_id,
+                "quiz_id": quiz_id,
+                "quiz_title": quiz.get("title", ""),
+                "user_id": submission.user_id,
+                "score": score_result["score"],
+                "percentage": score_result["percentage"],
+                "passed": score_result["passed"],
+                "total_questions": score_result["total_questions"],
+                "correct_answers": score_result["correct_answers"],
+                "total_points": score_result["total_points"],
+                "earned_points": score_result["earned_points"],
+                "submitted_at": submission_data["submitted_at"],
+                "message": "Quiz submitted successfully (memory mode)"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur soumission quiz: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/quiz/{quiz_id}/results/{user_id}")
+def get_user_quiz_results(quiz_id: str, user_id: str):
+    """Obtenir les résultats d'un utilisateur pour un quiz spécifique"""
+    try:
+        logger.info(f"📊 Récupération résultats quiz: {quiz_id} pour utilisateur: {user_id}")
+        
+        if is_mongodb_connected():
+            try:
+                from bson import ObjectId
+                
+                # Récupérer toutes les soumissions de l'utilisateur pour ce quiz
+                submissions = list(db.quiz_submissions.find({
+                    "quiz_id": quiz_id,
+                    "user_id": user_id
+                }).sort("submitted_at", -1))
+                
+                if not submissions:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No submissions found for this user and quiz"
+                    )
+                
+                # Récupérer les infos du quiz
+                quiz = db.quizzes.find_one({"_id": ObjectId(quiz_id)})
+                
+                # Calculer les statistiques
+                best_submission = max(submissions, key=lambda x: x.get("percentage", 0))
+                total_attempts = len(submissions)
+                average_score = sum(s.get("percentage", 0) for s in submissions) / total_attempts
+                
+                return {
+                    "user_id": user_id,
+                    "quiz_id": quiz_id,
+                    "quiz_title": quiz.get("title", "") if quiz else "Unknown Quiz",
+                    "total_attempts": total_attempts,
+                    "best_score": best_submission.get("score", 0),
+                    "best_percentage": best_submission.get("percentage", 0),
+                    "average_score": round(average_score, 2),
+                    "last_attempt": best_submission.get("submitted_at"),
+                    "submissions": [
+                        {
+                            "submission_id": str(s.get("_id", "")),
+                            "score": s.get("score", 0),
+                            "percentage": s.get("percentage", 0),
+                            "passed": s.get("passed", False),
+                            "submitted_at": s.get("submitted_at"),
+                            "correct_answers": s.get("correct_answers", 0),
+                            "total_questions": s.get("total_questions", 0)
+                        }
+                        for s in submissions[:10]  # Limiter à 10 dernières soumissions
+                    ]
+                }
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"❌ Erreur récupération résultats: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        else:
+            # Mode mémoire
+            storage_obj = get_memory_storage()
+            
+            # Récupérer les soumissions
+            submissions = [
+                s for s in storage_obj["quiz_submissions"]
+                if s.get("quiz_id") == quiz_id and s.get("user_id") == user_id
+            ]
+            
+            if not submissions:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No submissions found for this user and quiz"
+                )
+            
+            # Récupérer les infos du quiz
+            quiz = storage_obj["quizzes"].get(quiz_id, {})
+            
+            # Calculer les statistiques
+            best_submission = max(submissions, key=lambda x: x.get("percentage", 0))
+            total_attempts = len(submissions)
+            average_score = sum(s.get("percentage", 0) for s in submissions) / total_attempts
+            
+            return {
+                "user_id": user_id,
+                "quiz_id": quiz_id,
+                "quiz_title": quiz.get("title", "Unknown Quiz"),
+                "total_attempts": total_attempts,
+                "best_score": best_submission.get("score", 0),
+                "best_percentage": best_submission.get("percentage", 0),
+                "average_score": round(average_score, 2),
+                "last_attempt": best_submission.get("submitted_at"),
+                "submissions": [
+                    {
+                        "submission_id": s.get("_id", ""),
+                        "score": s.get("score", 0),
+                        "percentage": s.get("percentage", 0),
+                        "passed": s.get("passed", False),
+                        "submitted_at": s.get("submitted_at"),
+                        "correct_answers": s.get("correct_answers", 0),
+                        "total_questions": s.get("total_questions", 0)
+                    }
+                    for s in submissions[:10]
+                ]
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération résultats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/user/{user_id}/quiz-stats")
+def get_user_quiz_statistics(user_id: str, limit: int = 10):
+    """Obtenir les statistiques de quiz d'un utilisateur"""
+    try:
+        logger.info(f"📈 Récupération statistiques quiz pour utilisateur: {user_id}")
+        
+        if is_mongodb_connected():
+            try:
+                # Récupérer toutes les soumissions de l'utilisateur
+                submissions = list(db.quiz_submissions.find({
+                    "user_id": user_id
+                }).sort("submitted_at", -1))
+                
+                if not submissions:
+                    return {
+                        "user_id": user_id,
+                        "total_quizzes_taken": 0,
+                        "total_attempts": 0,
+                        "average_score": 0,
+                        "passed_quizzes": 0,
+                        "quiz_stats": []
+                    }
+                
+                # Grouper par quiz
+                quiz_stats = {}
+                for submission in submissions:
+                    quiz_id = submission.get("quiz_id")
+                    
+                    if quiz_id not in quiz_stats:
+                        # Récupérer les infos du quiz
+                        try:
+                            from bson import ObjectId
+                            quiz = db.quizzes.find_one({"_id": ObjectId(quiz_id)})
+                            quiz_title = quiz.get("title", "Unknown Quiz") if quiz else "Unknown Quiz"
+                        except:
+                            quiz_title = "Unknown Quiz"
+                        
+                        quiz_stats[quiz_id] = {
+                            "quiz_id": quiz_id,
+                            "quiz_title": quiz_title,
+                            "attempts": [],
+                            "best_score": 0,
+                            "best_percentage": 0,
+                            "last_attempt": None
+                        }
+                    
+                    quiz_stats[quiz_id]["attempts"].append(submission.get("percentage", 0))
+                    
+                    # Mettre à jour le meilleur score
+                    current_percentage = submission.get("percentage", 0)
+                    if current_percentage > quiz_stats[quiz_id]["best_percentage"]:
+                        quiz_stats[quiz_id]["best_percentage"] = current_percentage
+                        quiz_stats[quiz_id]["best_score"] = submission.get("score", 0)
+                    
+                    # Mettre à jour la dernière tentative
+                    current_date = submission.get("submitted_at")
+                    if not quiz_stats[quiz_id]["last_attempt"] or current_date > quiz_stats[quiz_id]["last_attempt"]:
+                        quiz_stats[quiz_id]["last_attempt"] = current_date
+                
+                # Calculer les statistiques globales
+                total_quizzes_taken = len(quiz_stats)
+                total_attempts = len(submissions)
+                all_percentages = [s.get("percentage", 0) for s in submissions]
+                average_score = sum(all_percentages) / total_attempts if total_attempts > 0 else 0
+                passed_attempts = sum(1 for s in submissions if s.get("passed", False))
+                
+                # Préparer la réponse
+                stats_list = []
+                for quiz_id, stats in list(quiz_stats.items())[:limit]:
+                    attempts_count = len(stats["attempts"])
+                    avg_quiz_score = sum(stats["attempts"]) / attempts_count if attempts_count > 0 else 0
+                    
+                    stats_list.append({
+                        "quiz_id": quiz_id,
+                        "quiz_title": stats["quiz_title"],
+                        "attempts_count": attempts_count,
+                        "best_score": stats["best_score"],
+                        "best_percentage": stats["best_percentage"],
+                        "average_score": round(avg_quiz_score, 2),
+                        "last_attempt": stats["last_attempt"]
+                    })
+                
+                return {
+                    "user_id": user_id,
+                    "total_quizzes_taken": total_quizzes_taken,
+                    "total_attempts": total_attempts,
+                    "average_score": round(average_score, 2),
+                    "passed_quizzes": passed_attempts,
+                    "pass_rate": round((passed_attempts / total_attempts * 100), 2) if total_attempts > 0 else 0,
+                    "quiz_stats": stats_list
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ Erreur récupération statistiques: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        else:
+            # Mode mémoire
+            storage_obj = get_memory_storage()
+            
+            # Récupérer les soumissions
+            submissions = [
+                s for s in storage_obj["quiz_submissions"]
+                if s.get("user_id") == user_id
+            ]
+            
+            if not submissions:
+                return {
+                    "user_id": user_id,
+                    "total_quizzes_taken": 0,
+                    "total_attempts": 0,
+                    "average_score": 0,
+                    "passed_quizzes": 0,
+                    "quiz_stats": []
+                }
+            
+            # Grouper par quiz (logique similaire à MongoDB)
+            # ... (implémentation similaire pour le mode mémoire)
+            
+            return {
+                "user_id": user_id,
+                "total_quizzes_taken": 0,
+                "total_attempts": 0,
+                "average_score": 0,
+                "passed_quizzes": 0,
+                "message": "Statistics not implemented in memory mode"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération statistiques: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/quiz/{quiz_id}/leaderboard")
+def get_quiz_leaderboard(quiz_id: str, top_n: int = 10):
+    """Obtenir le classement pour un quiz"""
+    try:
+        logger.info(f"🏆 Récupération classement quiz: {quiz_id}")
+        
+        if is_mongodb_connected():
+            try:
+                # Pipeline d'agrégation pour obtenir les meilleurs scores par utilisateur
+                pipeline = [
+                    {"$match": {"quiz_id": quiz_id}},
+                    {"$sort": {"percentage": -1, "submitted_at": -1}},
+                    {"$group": {
+                        "_id": "$user_id",
+                        "best_score": {"$first": "$score"},
+                        "best_percentage": {"$first": "$percentage"},
+                        "last_attempt": {"$first": "$submitted_at"},
+                        "attempts_count": {"$sum": 1}
+                    }},
+                    {"$sort": {"best_percentage": -1}},
+                    {"$limit": top_n}
+                ]
+                
+                results = list(db.quiz_submissions.aggregate(pipeline))
+                
+                # Récupérer les infos du quiz
+                from bson import ObjectId
+                quiz = db.quizzes.find_one({"_id": ObjectId(quiz_id)})
+                
+                leaderboard = []
+                for i, result in enumerate(results):
+                    leaderboard.append({
+                        "rank": i + 1,
+                        "user_id": result["_id"],
+                        "score": result["best_score"],
+                        "percentage": result["best_percentage"],
+                        "last_attempt": result["last_attempt"],
+                        "attempts_count": result["attempts_count"]
+                    })
+                
+                return {
+                    "quiz_id": quiz_id,
+                    "quiz_title": quiz.get("title", "") if quiz else "Unknown Quiz",
+                    "total_participants": len(results),
+                    "leaderboard": leaderboard
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ Erreur récupération classement: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        else:
+            return {
+                "quiz_id": quiz_id,
+                "message": "Leaderboard not implemented in memory mode"
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération classement: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ========== STATS ENDPOINT ==========
 
 @app.get("/stats")
@@ -1019,16 +1592,29 @@ def get_stats():
                 micro_lessons_count = db.lessons.count_documents({"is_micro_lesson": True})
                 quizzes_count = db.quizzes.count_documents({})
                 uploads_count = db.uploads.count_documents({})
+                quiz_submissions_count = db.quiz_submissions.count_documents({})
                 
                 # Total des vues de leçons
                 pipeline = [{"$group": {"_id": None, "total_views": {"$sum": "$views"}}}]
                 views_result = list(db.lessons.aggregate(pipeline))
                 total_views = views_result[0]["total_views"] if views_result else 0
                 
+                # Statistiques des quiz
+                quiz_pipeline = [
+                    {"$group": {
+                        "_id": None,
+                        "total_attempts": {"$sum": "$attempts"},
+                        "avg_score": {"$avg": "$average_score"}
+                    }}
+                ]
+                quiz_stats_result = list(db.quizzes.aggregate(quiz_pipeline))
+                total_quiz_attempts = quiz_stats_result[0]["total_attempts"] if quiz_stats_result else 0
+                avg_quiz_score = quiz_stats_result[0]["avg_score"] if quiz_stats_result else 0
+                
                 storage = "mongodb"
             except Exception as e:
                 logger.error(f"Erreur MongoDB stats: {e}")
-                courses_count = lessons_count = micro_lessons_count = quizzes_count = uploads_count = total_views = 0
+                courses_count = lessons_count = micro_lessons_count = quizzes_count = uploads_count = quiz_submissions_count = total_views = total_quiz_attempts = avg_quiz_score = 0
                 storage = "error"
         else:
             storage_obj = get_memory_storage()
@@ -1037,7 +1623,10 @@ def get_stats():
             micro_lessons_count = len([l for l in storage_obj["lessons"].values() if l.get("is_micro_lesson", False)])
             quizzes_count = len(storage_obj["quizzes"])
             uploads_count = len(storage_obj["uploads"])
+            quiz_submissions_count = len(storage_obj["quiz_submissions"])
             total_views = sum(l.get("views", 0) for l in storage_obj["lessons"].values())
+            total_quiz_attempts = sum(q.get("attempts", 0) for q in storage_obj["quizzes"].values())
+            avg_quiz_score = sum(q.get("average_score", 0) for q in storage_obj["quizzes"].values()) / quizzes_count if quizzes_count > 0 else 0
             storage = "memory"
         
         ratio = (micro_lessons_count/lessons_count*100) if lessons_count > 0 else 0
@@ -1048,7 +1637,10 @@ def get_stats():
             "micro_lessons_count": micro_lessons_count,
             "quizzes_count": quizzes_count,
             "uploads_count": uploads_count,
+            "quiz_submissions_count": quiz_submissions_count,
             "total_lesson_views": total_views,
+            "total_quiz_attempts": total_quiz_attempts,
+            "average_quiz_score": round(avg_quiz_score, 2),
             "micro_learning_ratio": f"{ratio:.1f}%",
             "storage": storage,
             "timestamp": datetime.utcnow().isoformat()
@@ -1084,6 +1676,10 @@ if __name__ == "__main__":
     print("  GET  /lessons/{id}  - Récupérer une leçon")
     print("  POST /quiz          - Créer un quiz")
     print("  GET  /quiz          - Lister les quiz")
+    print("  POST /quiz/{id}/submit - Soumettre un quiz")
+    print("  GET  /quiz/{id}/results/{user_id} - Voir résultats")
+    print("  GET  /user/{id}/quiz-stats - Statistiques utilisateur")
+    print("  GET  /quiz/{id}/leaderboard - Classement du quiz")
     print("  GET  /stats         - Statistiques micro-learning")
     print("  GET  /health        - Health check")
     print("=" * 60)
@@ -1092,6 +1688,9 @@ if __name__ == "__main__":
     print("  • Découpage intelligent (NLTK)")
     print("  • Durée optimisée (5 min par défaut)")
     print("  • Détection automatique micro-leçons")
+    print("  • Création et passage de quiz")
+    print("  • Suivi des scores et statistiques")
+    print("  • Classement des participants")
     print("  • Statistiques dédiées")
     print("=" * 60)
     
