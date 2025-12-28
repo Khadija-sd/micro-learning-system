@@ -1,34 +1,51 @@
+# Base image Python
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# 1. Installer les outils système nécessaires
 RUN apt-get update && apt-get install -y \
+    wget \
     curl \
-    gcc \
+    gnupg2 \
+    procps \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install NLTK data
-RUN python -m pip install --no-cache-dir nltk && \
-    python -m nltk.downloader punkt stopwords && \
-    python -m nltk.downloader averaged_perceptron_tagger
+# 2. Installer Dapr CLI
+RUN wget -q https://github.com/dapr/cli/releases/download/v1.12.0/dapr_linux_amd64.tar.gz \
+    && tar -xzf dapr_linux_amd64.tar.gz \
+    && mv dapr /usr/local/bin/ \
+    && chmod +x /usr/local/bin/dapr \
+    && rm dapr_linux_amd64.tar.gz
 
-# Copy requirements and install
+# 3. Installer Dapr runtime (daprd)
+RUN wget -q https://github.com/dapr/dapr/releases/download/v1.12.0/daprd_linux_amd64.tar.gz \
+    && tar -xzf daprd_linux_amd64.tar.gz \
+    && mv daprd /usr/local/bin/ \
+    && chmod +x /usr/local/bin/daprd \
+    && rm daprd_linux_amd64.tar.gz
+
+# 4. Initialiser Dapr
+RUN mkdir -p /app/.dapr/components
+
+# 5. Copier et installer les dépendances Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m nltk.downloader punkt stopwords averaged_perceptron_tagger
 
-# Copy application
+# 6. Copier l'application
 COPY . .
 
-# Create uploads directory
-RUN mkdir -p uploads && chmod 755 uploads
+# 7. Créer le dossier uploads
+RUN mkdir -p uploads
 
-# Expose port
-EXPOSE 8001
+# 8. Exposer les ports
+EXPOSE 8001 3500 50001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8001/health || exit 1
+# 9. Script de démarrage
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
 
-# Run the application
-CMD ["python", "app.py"]
+# 10. Commande par défaut
+CMD ["/app/start.sh"]

@@ -1,92 +1,71 @@
+version: '3.8'
+
 services:
-  # PostgreSQL for User Service
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_DB: userdb
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+  # Redis pour Dapr PubSub
+  redis:
+    image: redis:7-alpine
+    container_name: redis
     ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - "6379:6379"
+    command: redis-server --appendonly yes
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user"]
-      interval: 10s
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
       timeout: 5s
       retries: 5
 
-  # MongoDB for Content Service
+  # MongoDB pour Content Service
   mongodb:
-    image: mongo:6
+    image: mongo:latest
+    container_name: mongodb
     ports:
       - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
     environment:
       MONGO_INITDB_ROOT_USERNAME: admin
       MONGO_INITDB_ROOT_PASSWORD: password
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-
-  # Redis for DAPR pub/sub
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
       timeout: 5s
       retries: 5
 
-  # User Service
-  user-service:
-    build: ./user-service
-    ports:
-      - "8000:8000"
-    environment:
-      DATABASE_URL: postgresql://user:password@postgres:5432/userdb
-      SECRET_KEY: development-secret-key-change-in-production
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./user-service/src:/app/src
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
   # Content Service
   content-service:
-    build: ./content-service
+    build: 
+      context: ./content-service
+      dockerfile: Dockerfile
+    container_name: content-service
     ports:
       - "8001:8001"
+      - "3500:3500"
     environment:
       MONGODB_URL: mongodb://admin:password@mongodb:27017
       MONGODB_DB: contentdb
       UPLOAD_DIR: /app/uploads
-    depends_on:
-      mongodb:
-        condition: service_healthy
     volumes:
-      - ./content-service:/app
-      - ./uploads:/app/uploads
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      - ./content-service/uploads:/app/uploads
+
+  # Notification Service - H2 au lieu de PostgreSQL
+  notification-service:
+    build: 
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    ports:
+      - "8082:8082"
+      - "3501:3500"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:h2:mem:notificationdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+      SPRING_DATASOURCE_USERNAME: sa
+      SPRING_DATASOURCE_PASSWORD: 
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.h2.Driver
+      SPRING_JPA_HIBERNATE_DDL_AUTO: create-drop
+      SPRING_JPA_DATABASE_PLATFORM: org.hibernate.dialect.H2Dialect
+      SPRING_H2_CONSOLE_ENABLED: "true"
+      SPRING_H2_CONSOLE_PATH: /h2-console
+      SERVER_PORT: "8082"
+    depends_on:
+      - redis  # On n'attend plus PostgreSQL
 
 volumes:
-  postgres_data:
-  mongodb_data:
-  redis_data:
+  micro-learning-system_postgres_notification_data:

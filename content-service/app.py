@@ -7,10 +7,14 @@ import logging
 from datetime import datetime
 import os
 import time
-import sys
+import json
 import tempfile
 import shutil
 import re
+
+# Ajout des imports Dapr
+from dapr.ext.fastapi import DaprApp
+from dapr.clients import DaprClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -192,6 +196,9 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+# Initialisation de Dapr
+dapr_app = DaprApp(app)
 
 # ========== FONCTIONS UTILITAIRES ==========
 def get_memory_storage():
@@ -606,6 +613,78 @@ def health():
             "timestamp": datetime.utcnow().isoformat()
         }
 
+# ========== DAPR SUBSCRIPTIONS ==========
+
+# Modifiez temporairement la route
+@app.get("/dapr/subscriptions")  # Changez le nom
+def subscribe():
+    """Retourne les subscriptions Dapr pour ce service"""
+    subscriptions = [
+        {
+            "pubsubname": "pubsub",
+            "topic": "quiz_completed",
+            "route": "/events/quiz-completed"
+        },
+        {
+            "pubsubname": "pubsub",
+            "topic": "course_created", 
+            "route": "/events/course-created"
+        }
+    ]
+    logger.info(f"📡 Subscriptions Dapr envoyées: {subscriptions}")
+    return subscriptions
+# ========== DAPR EVENT HANDLER ==========
+
+@app.post("/events/{event_type}")
+async def handle_event(event_type: str, request: dict):
+    """Gestionnaire d'événements Dapr"""
+    logger.info(f"📨 Événement reçu: {event_type}")
+    
+    # Afficher les données reçues (formatées)
+    logger.debug(f"📦 Données reçues: {json.dumps(request, indent=2)}")
+    
+    if event_type == "quiz-completed":
+        # Traiter l'événement quiz complété
+        quiz_id = request.get("quiz_id")
+        user_id = request.get("user_id")
+        score = request.get("score")
+        
+        logger.info(f"📝 Quiz {quiz_id} complété par {user_id} avec score {score}")
+        
+        # Mettre à jour les statistiques ou déclencher d'autres actions
+        return {"status": "processed", "event": event_type}
+    
+    elif event_type == "course-created":
+        # Traiter l'événement cours créé
+        course_id = request.get("course_id")
+        teacher_id = request.get("teacher_id")
+        
+        logger.info(f"📚 Cours {course_id} créé par professeur {teacher_id}")
+        
+        # Optionnel: Publier un autre événement
+        try:
+            dapr_client = DaprClient()
+            await dapr_client.publish_event(
+                pubsub_name="pubsub",
+                topic_name="content_ready",
+                data={
+                    "course_id": course_id,
+                    "message": f"Cours transformé en micro-leçons",
+                    "timestamp": datetime.utcnow().isoformat()
+                },
+                data_content_type='application/json'
+            )
+            logger.info(f"📤 Événement content_ready publié pour le cours {course_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur publication événement: {e}")
+        
+        return {"status": "processed", "event": event_type}
+    
+    else:
+        logger.warning(f"⚠️ Événement non reconnu: {event_type}")
+        return {"status": "ignored", "event": event_type, "message": "Event type not recognized"}
+
 # ========== UPLOAD ENDPOINT ==========
 
 @app.post("/upload", response_model=UploadResponse)
@@ -761,6 +840,31 @@ async def upload_and_transform_course(
                             storage_obj["courses"][course_id].get("lesson_count", 0) + 1
                 
                 lessons_created.append(lesson_id)
+            
+            # Publier un événement Dapr pour notifier la création du cours
+            try:
+                dapr_client = DaprClient()
+                
+                await dapr_client.publish_event(
+                    pubsub_name="pubsub",
+                    topic_name="course_created",
+                    data={
+                        "course_id": course_id,
+                        "teacher_id": teacher_id,
+                        "title": title,
+                        "subject": subject,
+                        "micro_lessons_count": len(lessons_created),
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "service": "content-service"
+                    },
+                    data_content_type='application/json'
+                )
+                
+                logger.info(f"📤 Événement publié: course_created pour {course_id}")
+                
+            except Exception as pub_error:
+                logger.error(f"❌ Erreur publication événement Dapr: {pub_error}")
+                # Ne pas lever d'exception, continuer avec le résultat
             
             logger.info(f"✅ Upload réussi: {len(lessons_created)} micro-leçons créées")
             
@@ -1131,7 +1235,7 @@ def get_quizzes(course_id: Optional[str] = None):
 # ========== ENDPOINTS AJOUTÉS POUR LES QUIZ ==========
 
 @app.post("/quiz/{quiz_id}/submit")
-def submit_quiz_answers(quiz_id: str, submission: QuizSubmissionRequest):
+async def submit_quiz_answers(quiz_id: str, submission: QuizSubmissionRequest):
     """Soumettre les réponses d'un quiz et obtenir le score"""
     try:
         logger.info(f"📝 Soumission quiz: {quiz_id} par utilisateur: {submission.user_id}")
@@ -1178,6 +1282,32 @@ def submit_quiz_answers(quiz_id: str, submission: QuizSubmissionRequest):
                 
                 # Mettre à jour les statistiques du quiz
                 update_quiz_statistics(quiz_id, score_result["percentage"])
+                
+                # Publier un événement Dapr
+                try:
+                    dapr_client = DaprClient()
+                    
+                    await dapr_client.publish_event(
+                        pubsub_name="pubsub",
+                        topic_name="quiz_completed",
+                        data={
+                            "quiz_id": quiz_id,
+                            "user_id": submission.user_id,
+                            "score": score_result["score"],
+                            "percentage": score_result["percentage"],
+                            "passed": score_result["passed"],
+                            "total_questions": score_result["total_questions"],
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "service": "content-service"
+                        },
+                        data_content_type='application/json'
+                    )
+                    
+                    logger.info(f"📤 Événement publié: quiz_completed pour {quiz_id}")
+                    
+                except Exception as pub_error:
+                    logger.error(f"❌ Erreur publication événement Dapr: {pub_error}")
+                    # Ne pas lever d'exception, continuer avec le résultat du quiz
                 
                 logger.info(f"✅ Quiz soumis: {quiz['title']}, Score: {score_result['score']}/{score_result['total_points']} ({score_result['percentage']}%)")
                 
@@ -1682,6 +1812,8 @@ if __name__ == "__main__":
     print("  GET  /quiz/{id}/leaderboard - Classement du quiz")
     print("  GET  /stats         - Statistiques micro-learning")
     print("  GET  /health        - Health check")
+    print("  GET  /dapr/subscribe - Subscriptions Dapr")
+    print("  POST /events/{type} - Gestionnaire d'événements Dapr")
     print("=" * 60)
     print("🎯 Micro-learning features:")
     print("  • Upload automatique PDF/TXT → micro-leçons")
@@ -1692,6 +1824,12 @@ if __name__ == "__main__":
     print("  • Suivi des scores et statistiques")
     print("  • Classement des participants")
     print("  • Statistiques dédiées")
+    print("=" * 60)
+    print("🔌 Dapr integration:")
+    print("  • Publication événements quiz_completed")
+    print("  • Publication événements course_created")
+    print("  • Réception événements via /events/{type}")
+    print("  • Auto-subscription via /dapr/subscribe")
     print("=" * 60)
     
     # Initialiser memory_storage au cas où
